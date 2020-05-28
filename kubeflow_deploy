@@ -31,6 +31,167 @@ COPY seq2seq_utils.py /workdir/seq2seq_utils.py
 docker build -f Dockerfile -t ${IMG}:${TAG} ./
 gcloud docker --push #{IMG}:${TAG}
 
+# Abrir projeto em Google Could Platform e ativar Google Could Shell em modo boost.
+wget https://github.com/kubeflow/examples/archive/v0.2.zip
+unzip v0.2.zip
+mv examples-0.2 ${HOME}/examples
+export \
+  GITHUB_TOKEN=<token>
+export KS_VER=ks_0.13.1_linux_amd64
+wget -O /tmp/$KS_VER.tar.gz https://github.com/ksonnet/ksonnet/releases/download/v0.13.1/$KS_VER.tar.gz
+mkdir -p ${HOME}/bin
+tar -xvf /tmp/$KS_VER.tar.gz -C ${HOME}/bin
+export PATH=$PATH:${HOME}/bin/$KS_VER
+export PROJECT_ID=$(gcloud config get-value project)
+
+export SERVICE_ACCOUNT=github-issue-summarization
+export SERVICE_ACCOUNT_EMAIL=${SERVICE_ACCOUNT}@${PROJECT_ID}.iam.gserviceaccount.com
+gcloud iam service-accounts create ${SERVICE_ACCOUNT} \
+  --display-name "GCP Service Account for use with kubeflow examples"
+
+gcloud projects add-iam-policy-binding ${PROJECT_ID} --member \
+  serviceAccount:${SERVICE_ACCOUNT_EMAIL} \
+  --role=roles/storage.admin
+
+
+export KEY_FILE=${HOME}/secrets/${SERVICE_ACCOUNT_EMAIL}.json
+gcloud iam service-accounts keys create ${KEY_FILE} \
+  --iam-account ${SERVICE_ACCOUNT_EMAIL}
+
+export KEY_FILE=${HOME}/secrets/${SERVICE_ACCOUNT_EMAIL}.json
+gcloud iam service-accounts keys create ${KEY_FILE} \
+  --iam-account ${SERVICE_ACCOUNT_EMAIL}
+
+export BUCKET=kubeflow-${PROJECT_ID}
+gsutil mb -c regional -l us-central1 gs://${BUCKET}
+
+gcloud container clusters create kubeflow-qwiklab \
+  --machine-type n1-standard-4 \
+  --zone us-central1-a  \
+  --scopes=compute-rw,storage-rw \
+  --enable-autorepair
+
+gcloud container clusters get-credentials kubeflow-qwiklab --zone us-central1-a
+kubectl cluster-info
+kubectl create clusterrolebinding default-admin \
+  --clusterrole=cluster-admin \
+  --user=$(gcloud config get-value account)
+kubectl create secret generic user-gcp-sa \
+  --from-file=user-gcp-sa.json="${KEY_FILE}"
+
+cd ${HOME}/examples/github_issue_summarization
+ks init kubeflow
+cd kubeflow
+cp ../ks-kubeflow/components/kubeflow-core.jsonnet components
+cp ../ks-kubeflow/components/params.libsonnet components
+cp ../ks-kubeflow/components/seldon.jsonnet components
+cp ../ks-kubeflow/components/tfjob-v1alpha2.* components
+cp ../ks-kubeflow/components/ui.* components
+
+export VERSION=v0.2.0-rc.1
+ks registry add kubeflow github.com/kubeflow/kubeflow/tree/${VERSION}/kubeflow
+
+ks pkg install kubeflow/core@${VERSION}
+ks pkg install kubeflow/tf-serving@${VERSION}
+ks pkg install kubeflow/tf-job@${VERSION}
+ks pkg install kubeflow/seldon@${VERSION}
+
+ks env add gke
+ks param set --env gke kubeflow-core \
+  cloud "gke"
+ks param set --env gke kubeflow-core \
+  tfAmbassadorServiceType "LoadBalancer"
+
+
+ks apply gke -c kubeflow-core -c seldon
+kubectl get pods
+cd ${HOME}/examples/github_issue_summarization/kubeflow
+ks param set --env gke tfjob-v1alpha2 image "gcr.io/kubeflow-examples/tf-job-issue-summarization:v20180629-v0.1-2-g98ed4b4-dirty-182929"
+ks param set --env gke tfjob-v1alpha2 output_model_gcs_bucket "${BUCKET}"
+
+cd ${HOME}/examples/github_issue_summarization/notebooks
+
+make PROJECT=${PROJECT_ID} push
+
+
+export TAG=$(gcloud container images list-tags \
+
+gcr.io/${PROJECT_ID}/tf-job-issue-summarization \
+
+--limit=1 \
+
+--format='get(tags)')
+
+cd ${HOME}/examples/github_issue_summarization/kubeflow
+
+ks param set --env gke tfjob-v1alpha2 image "gcr.io/${PROJECT_ID}/tf-job-issue-summarization:${TAG}
+
+ks apply gke -c tfjob-v1alpha2
+kubectl get pods
+kubectl logs -f \
+  $(kubectl get pods -ltf_job_key=tfjob-issue-summarization -o=jsonpath='{.items[0].metadata.name}')
+
+gsutil ls gs://${BUCKET}/github-issue-summarization-data
+
+export SERVING_IMAGE=gcr.io/kubeflow-examples/issue-summarization-model:v20180629-v0.1-2-g98ed4b4-dirty-182929
+
+cd ${HOME}/examples/github_issue_summarization/notebooksgsutil cp gs://${BUCKET}/github-issue-summarization-data/* .
+
+docker run -v $(pwd):/my_model seldonio/core-python-wrapper:0.7 \
+
+/my_model IssueSummarization 0.1 gcr.io \
+
+--base-image=python:3.6 \
+
+--image-name=${PROJECT_ID}/issue-summarization-model
+
+cd ${HOME}/examples/github_issue_summarization/notebooks/build
+
+./build_image.sh
+
+gcloud docker -- push gcr.io/${PROJECT_ID}/issue-summarization-model:0.1
+
+export SERVING_IMAGE=gcr.io/${PROJECT_ID}/issue-summarization-model:0.1
+
+cd ${HOME}/examples/github_issue_summarization/kubeflow
+ks generate seldon-serve-simple issue-summarization-model \
+  --name=issue-summarization \
+  --image=${SERVING_IMAGE} \
+  --replicas=2
+
+ks apply gke -c issue-summarization-model
+
+kubectl get pods
+
+kubectl logs \
+  $(kubectl get pods \
+    -lseldon-app=issue-summarization \
+    -o=jsonpath='{.items[0].metadata.name}') \
+  issue-summarization
+
+cd ${HOME}/examples/github_issue_summarization/kubeflow
+ks param set --env gke ui image "gcr.io/kubeflow-examples/issue-summarization-ui:v20180629-v0.1-2-g98ed4b4-dirty-182929"
+ks param set --env gke ui githubToken ${GITHUB_TOKEN}
+ks param set --env gke ui modelUrl "http://issue-summarization.default.svc.cluster.local:8000/api/v0.1/predictions"
+ks param set --env gke ui serviceType "LoadBalancer"
+
+cd ${HOME}/examples/github_issue_summarization/docker
+docker build -t gcr.io/${PROJECT_ID}/issue-summarization-ui:latest .
+
+gcloud docker -- push gcr.io/${PROJECT_ID}/issue-summarization-ui:latest
+
+cd ${HOME}/examples/github_issue_summarization/kubeflow
+ks param set --env gke ui image gcr.io/${PROJECT_ID}/issue-summarization-ui:latest
+
+ks apply gke -c ui
+
+kubectl get svc issue-summarization-ui
+
+kubectl logs -f \
+  $(kubectl get pods \
+    -lseldon-app=issue-summarization \
+    -o=jsonpath='{.items[0].metadata.name}') \
+  issue-summarization
 
 
 

@@ -1,0 +1,37 @@
+# CLI based deployment
+
+# uses kfctl
+# Controlled by commands: init, generate, apply, delete
+
+kfctl.sh init ${KFAPP} - platform gcp -- project ${PROJECT}
+cd ${KFAPP}
+kfctl.sh generate platform
+kfctl.sh apply platform
+kfctl.sh generate k8s
+kfctl.sh apply k8s
+
+# Aspecto positivo: a configuração é feita com arquivo que está disponível localmente e que você pode alterar.
+# ${KFAPP}/gcp_config contem Deployment Manager config files (GKE)
+# ${KFAPP}/k8s_specs contem YAML specs for daemons deployed on k8s cluster
+# ${KFAPP}/k8s_app contem ksonnet application for Kubeflow
+
+# Image on Jupyter Notebook contendo suporte a TensorFlow: gcr.io/kubeflow-images-public/tensorflow-1.8.0-notebook-cpu:v0.2.1
+
+### BUILDING DOCKER IMAGE
+
+FROM gcr.io/kubeflow-images-public/tensorflow-1.8.0-notebook-cpu:v0.2.1
+RUN pip install ktext
+RUN pip install annoy
+RUN pip install --upgrade google-cloud
+RUN pip install sklearn h5py
+RUN pip install nltk
+COPY train.py /workdir/train.py
+COPY seq2seq_utils.py /workdir/seq2seq_utils.py
+
+docker build -f Dockerfile -t ${IMG}:${TAG} ./
+gcloud docker --push #{IMG}:${TAG}
+
+
+
+
+
